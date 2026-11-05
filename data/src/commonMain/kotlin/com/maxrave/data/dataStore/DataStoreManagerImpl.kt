@@ -16,7 +16,6 @@ import com.maxrave.domain.data.player.ReverbPreset
 import com.maxrave.domain.manager.DataStoreManager
 import com.maxrave.domain.manager.DataStoreManager.Values.AI_PROVIDER_GEMINI
 import com.maxrave.domain.manager.DataStoreManager.Values.FALSE
-import com.maxrave.domain.manager.DataStoreManager.Values.GITHUB
 import com.maxrave.domain.manager.DataStoreManager.Values.LOCAL_PLAYLIST_FILTER_OLDER_FIRST
 import com.maxrave.domain.manager.DataStoreManager.Values.PROXY_TYPE_HTTP
 import com.maxrave.domain.manager.DataStoreManager.Values.PROXY_TYPE_SOCKS
@@ -1225,38 +1224,6 @@ internal class DataStoreManagerImpl(
         }
     }
 
-    override val autoCheckForUpdates =
-        settingsDataStore.data.map { preferences ->
-            preferences[AUTO_CHECK_FOR_UPDATES] ?: TRUE
-        }
-
-    override suspend fun setAutoCheckForUpdates(autoCheck: Boolean) {
-        withContext(Dispatchers.IO) {
-            if (autoCheck) {
-                settingsDataStore.edit { settings ->
-                    settings[AUTO_CHECK_FOR_UPDATES] = TRUE
-                }
-            } else {
-                settingsDataStore.edit { settings ->
-                    settings[AUTO_CHECK_FOR_UPDATES] = FALSE
-                }
-            }
-        }
-    }
-
-    override val updateChannel =
-        settingsDataStore.data.map { preferences ->
-            preferences[UPDATE_CHANNEL] ?: GITHUB
-        }
-
-    override suspend fun setUpdateChannel(channel: String) {
-        withContext(Dispatchers.IO) {
-            settingsDataStore.edit { settings ->
-                settings[UPDATE_CHANNEL] = channel
-            }
-        }
-    }
-
     override val playbackSpeed =
         settingsDataStore.data.map { preferences ->
             preferences[PLAYBACK_SPEED] ?: 1.0f
@@ -1942,8 +1909,6 @@ internal class DataStoreManagerImpl(
         val KEEP_YOUTUBE_PLAYLIST_OFFLINE = stringPreferencesKey("keep_youtube_playlist_offline")
         val COMBINE_LOCAL_AND_YOUTUBE_LIKED = stringPreferencesKey("combine_local_and_youtube_liked")
         val SHOULD_SHOW_LOG_IN_REQUIRED_ALERT = stringPreferencesKey("should_show_log_in_required_alert")
-        val AUTO_CHECK_FOR_UPDATES = stringPreferencesKey("auto_check_for_updates")
-        val UPDATE_CHANNEL = stringPreferencesKey("update_channel")
         val PLAYBACK_SPEED = floatPreferencesKey("playback_speed")
         val PITCH = intPreferencesKey("pitch")
         val OPEN_APP_TIME = intPreferencesKey("open_app_time")

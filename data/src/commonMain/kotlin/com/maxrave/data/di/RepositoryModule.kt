@@ -21,7 +21,6 @@ import com.maxrave.data.repository.SearchRepositoryImpl
 import com.maxrave.data.repository.SongRepositoryImpl
 import com.maxrave.data.repository.StreamRepositoryImpl
 import com.maxrave.data.repository.TasteRepositoryImpl
-import com.maxrave.data.repository.UpdateRepositoryImpl
 import com.maxrave.domain.repository.AccountRepository
 import com.maxrave.domain.repository.AlbumRepository
 import com.maxrave.domain.repository.AnalyticsRepository
@@ -40,7 +39,6 @@ import com.maxrave.domain.repository.SearchRepository
 import com.maxrave.domain.repository.SongRepository
 import com.maxrave.domain.repository.StreamRepository
 import com.maxrave.domain.repository.TasteRepository
-import com.maxrave.domain.repository.UpdateRepository
 import org.koin.core.qualifier.named
 import org.koin.dsl.module
 
@@ -118,10 +116,6 @@ val repositoryModule =
 
         single<StreamRepository>(createdAtStart = true) {
             StreamRepositoryImpl(get(), get())
-        }
-
-        single<UpdateRepository>(createdAtStart = true) {
-            UpdateRepositoryImpl(get())
         }
 
         single<AnalyticsRepository>(createdAtStart = true) {

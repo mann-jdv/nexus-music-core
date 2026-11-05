@@ -59,8 +59,6 @@ import com.maxrave.kotlinytmusicscraper.models.response.TidalOAuthResponse
 import com.maxrave.kotlinytmusicscraper.models.response.RemoteConfig
 import com.maxrave.kotlinytmusicscraper.models.response.toLikeStatus
 import com.maxrave.kotlinytmusicscraper.models.response.toListAccountInfo
-import com.maxrave.kotlinytmusicscraper.models.simpmusic.FdroidResponse
-import com.maxrave.kotlinytmusicscraper.models.simpmusic.GithubResponse
 import com.maxrave.kotlinytmusicscraper.models.sponsorblock.SkipSegments
 import com.maxrave.kotlinytmusicscraper.models.youtube.GhostResponse
 import com.maxrave.kotlinytmusicscraper.models.youtube.Transcript
@@ -901,27 +899,6 @@ class YouTube {
     suspend fun getSkipSegments(videoId: String): Result<List<SkipSegments>> =
         runCatching {
             ytMusic.getSkipSegments(videoId).body<List<SkipSegments>>()
-        }
-
-    suspend fun checkForGithubReleaseUpdate(): Result<GithubResponse> =
-        runCatching {
-            ytMusic.checkForGithubReleaseUpdate().body<GithubResponse>()
-        }
-
-    suspend fun checkForFdroidUpdate(): Result<FdroidResponse> =
-        runCatching {
-            ytMusic.checkForFdroidUpdate().body<FdroidResponse>()
-        }
-
-    /**
-     * SHA-256 of our release signing certificates: F-Droid ships the APK we sign, so it pins our keys.
-     * The field is either one inline value or a YAML list (`- <hex>` per line), e.g. after a key rotation.
-     */
-    suspend fun getFdroidSigningKeys(): Result<List<String>> =
-        runCatching {
-            val metadata = ytMusic.fdroidMetadata().bodyAsText()
-            val field = checkNotNull(Regex("""AllowedAPKSigningKeys:((?:\s*-?\s*[0-9a-f]{64})+)""").find(metadata)).groupValues[1]
-            Regex("[0-9a-f]{64}").findAll(field).map { it.value }.toList()
         }
 
     suspend fun newRelease(): Result<ExplorePage> =
