@@ -132,6 +132,10 @@ interface MediaPlayerInterface {
     var playWhenReady: Boolean
     var playbackParameters: GenericPlaybackParameters
 
+    /** Live source and output information, never inferred from a quality setting. */
+    val playbackFidelity: StateFlow<com.maxrave.domain.data.player.PlaybackFidelity>
+        get() = NO_PLAYBACK_FIDELITY
+
     // Audio settings
     val audioSessionId: Int
     var volume: Float
@@ -245,3 +249,5 @@ interface MediaPlayerInterface {
 
 // What a backend that cannot list its outputs reports: nothing, and never anything else.
 private val NO_AUDIO_OUTPUTS: StateFlow<List<AudioOutput>> = MutableStateFlow(emptyList())
+
+private val NO_PLAYBACK_FIDELITY = MutableStateFlow(com.maxrave.domain.data.player.PlaybackFidelity())

@@ -38,6 +38,8 @@ internal class AudioOutputRouter(
     var preferredDevice: AudioDeviceInfo? = null
         private set
 
+    private var lastReportedActiveId: Int? = null
+
     private val deviceCallback =
         object : AudioDeviceCallback() {
             override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) = refresh()
@@ -57,6 +59,7 @@ internal class AudioOutputRouter(
         // Picking what the system is already using is not a preference. Pinning it would hold playback
         // on the phone speaker after a headset is plugged in later, which nobody asked for.
         preferredDevice = device?.takeIf { it.id != systemDeviceId(devices) }
+        lastReportedActiveId = activeDeviceId(devices)
         onPreferredChanged(preferredDevice)
         refresh()
     }
@@ -72,9 +75,11 @@ internal class AudioOutputRouter(
         val picked = preferredDevice
         if (picked != null && devices.none { it.id == picked.id }) {
             preferredDevice = null
-            onPreferredChanged(null)
         }
         val activeId = activeDeviceId(devices)
+        val previousId = lastReportedActiveId
+        lastReportedActiveId = activeId
+        if (previousId != null && previousId != activeId) onPreferredChanged(preferredDevice)
         _outputs.value =
             devices
                 .map { device ->

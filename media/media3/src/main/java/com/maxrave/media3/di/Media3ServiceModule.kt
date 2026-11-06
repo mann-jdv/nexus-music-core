@@ -192,6 +192,7 @@ private val mediaServiceModule =
 
         single<MediaPlayerInterface>(createdAtStart = true) {
             CrossfadeExoPlayerAdapter(
+                localMusicRepository = get(),
                 context = androidContext(),
                 coroutineScope = get(named(SERVICE_SCOPE)),
                 dataStoreManager = get(),

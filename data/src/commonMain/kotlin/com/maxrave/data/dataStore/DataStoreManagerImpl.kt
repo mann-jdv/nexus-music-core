@@ -248,6 +248,13 @@ internal class DataStoreManagerImpl(
         }
     }
 
+    override val bitPerfectLossless: Flow<Boolean> =
+        settingsDataStore.data.map { it[BIT_PERFECT_LOSSLESS] != FALSE }
+
+    override suspend fun setBitPerfectLossless(enabled: Boolean) {
+        settingsDataStore.edit { it[BIT_PERFECT_LOSSLESS] = if (enabled) TRUE else FALSE }
+    }
+
     override val normalizeVolume: Flow<String> =
         settingsDataStore.data.map { preferences ->
             preferences[NORMALIZE_VOLUME] ?: FALSE
@@ -1836,6 +1843,7 @@ internal class DataStoreManagerImpl(
         val QUALITY = stringPreferencesKey("quality")
         val DOWNLOAD_QUALITY = stringPreferencesKey("download_quality")
         val VIDEO_DOWNLOAD_QUALITY = stringPreferencesKey("video_download_quality")
+        val BIT_PERFECT_LOSSLESS = stringPreferencesKey("bit_perfect_lossless")
         val NORMALIZE_VOLUME = stringPreferencesKey("normalize_volume")
         val SKIP_SILENT = stringPreferencesKey("skip_silent")
         val SAVE_STATE_OF_PLAYBACK = stringPreferencesKey("save_state_of_playback")

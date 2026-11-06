@@ -3,6 +3,9 @@ package com.simpmusic.media_jvm.mpv
 import com.maxrave.common.LocalMedia
 import com.maxrave.common.MERGING_DATA_TYPE
 import com.maxrave.domain.data.player.AppOnScreen
+import com.maxrave.domain.data.player.PlaybackFidelity
+import com.maxrave.domain.data.player.isGaplessSuccessor
+import com.maxrave.domain.data.entities.LocalTrackEntity
 import com.maxrave.domain.data.player.AudioEffects
 import com.maxrave.domain.data.player.AudioOutput
 import com.maxrave.domain.data.player.AudioOutputKind
@@ -75,6 +78,7 @@ class MpvPlayerAdapter(
     private val coroutineScope: CoroutineScope,
     private val dataStoreManager: DataStoreManager,
     private val streamRepository: StreamRepository,
+    private val localMusicRepository: com.maxrave.domain.repository.LocalMusicRepository,
 ) : MediaPlayerInterface {
     // Internal state enum for proper state machine
     private enum class InternalState {
@@ -89,7 +93,36 @@ class MpvPlayerAdapter(
 
     private fun InternalState.isInReadyState(): Boolean = this == InternalState.READY || this == InternalState.PLAYING || this == InternalState.PAUSED
 
+    private var bitPerfectEnabled = true
+    private var localSources: Map<String, LocalTrackEntity> = emptyMap()
+    private val _playbackFidelity = MutableStateFlow(PlaybackFidelity())
+    override val playbackFidelity: StateFlow<PlaybackFidelity> = _playbackFidelity
+    private val bypassActive: Boolean get() = bitPerfectEnabled && _playbackFidelity.value.source?.lossless == true
+    private var gaplessNext: GenericMediaItem? = null
+    private var gaplessJob: Job? = null
+
+    private fun localCrossfadeBlocked(): Boolean {
+        val current = localSources[currentMediaItem?.mediaId]
+        val next = localSources[playlist.getOrNull(getNextMediaItemIndex())?.mediaId]
+        return current.isGaplessSuccessor(next) || (bitPerfectEnabled && (current?.lossless == true || next?.lossless == true))
+    }
+
     init {
+        coroutineScope.launch {
+            localMusicRepository.tracks.collect { localSources = it.associateBy { track -> track.id } }
+        }
+        coroutineScope.launch {
+            dataStoreManager.bitPerfectLossless.collect { enabled ->
+                if (bitPerfectEnabled != enabled) {
+                    bitPerfectEnabled = enabled
+                    if (_playbackFidelity.value.source?.lossless == true) {
+                        if (isCrossfading) commitIncomingAsCurrent()
+                        clearPrecacheExceptCurrentInternal()
+                        loadAndPlayTrackInternal(localCurrentMediaItemIndex, currentPosition, internalPlayWhenReady)
+                    }
+                }
+            }
+        }
         if (MpvLibrary.INSTANCE == null) {
             Logger.e(TAG, "libmpv not available — playback will fail until mpv is installed.")
         }
@@ -406,6 +439,9 @@ class MpvPlayerAdapter(
     }
 
     override fun stop() {
+        gaplessJob?.cancel()
+        gaplessNext = null
+        _playbackFidelity.value = PlaybackFidelity()
         coroutineScope.launch {
             currentPlayer?.let { player ->
                 Logger.d(TAG, "Stop called")
@@ -826,6 +862,9 @@ class MpvPlayerAdapter(
     }
 
     override fun clearMediaItems() {
+        gaplessJob?.cancel()
+        gaplessNext = null
+        _playbackFidelity.value = PlaybackFidelity()
         coroutineScope.launch {
             playlist.clear()
             localCurrentMediaItemIndex = -1
@@ -1035,6 +1074,7 @@ class MpvPlayerAdapter(
                 clearShuffleOrder()
             }
 
+            syncLocalGapless()
             val mediaItemList = getShuffledMediaItemList()
             notifyListeners { onShuffleModeEnabledChanged(value, mediaItemList) }
             notifyTimelineChanged("TIMELINE_CHANGE_REASON_PLAYLIST_CHANGED")
@@ -1045,6 +1085,7 @@ class MpvPlayerAdapter(
         set(value) {
             if (internalRepeatMode == value) return
             internalRepeatMode = value
+            syncLocalGapless()
             notifyListeners { onRepeatModeChanged(value) }
         }
 
@@ -1344,6 +1385,7 @@ class MpvPlayerAdapter(
     // ========== Release Resources ==========
 
     override fun release() {
+        gaplessJob?.cancel()
         currentLoadJob?.cancel()
         precacheJob?.cancel()
         positionUpdateJob?.cancel()
@@ -1485,6 +1527,11 @@ class MpvPlayerAdapter(
         currentLoadJob =
             coroutineScope.launch {
                 try {
+                    val local = if (LocalMedia.isLocal(videoId)) localMusicRepository.getTrack(videoId) else null
+                    if (local != null) localSources = localSources + (videoId to local)
+                    gaplessJob?.cancel()
+                    gaplessNext = null
+                    _playbackFidelity.value = PlaybackFidelity(source = local, bypassRequested = bitPerfectEnabled && local?.lossless == true)
                     transitionToState(InternalState.PREPARING)
 
                     // Notify media item transition (fire-and-forget to avoid
@@ -1540,6 +1587,7 @@ class MpvPlayerAdapter(
                     currentPlayerIsVideo = player.videoFrames != null
                     _currentVideoFrames.value = player.videoFrames
                     setupPlayerEventsInternal(player)
+                    player.setBitPerfect(bypassActive)
                     player.applyPlaybackLevels()
 
                     if (cachedPrecache != null) {
@@ -1642,6 +1690,24 @@ class MpvPlayerAdapter(
 
         val listener =
             object : MpvPlayerEventAdapter() {
+                override fun fileLoaded(player: MpvPlayer, path: String?) {
+                    coroutineScope.launch {
+                        if (player !== currentPlayer) return@launch
+                        val next = gaplessNext ?: return@launch
+                        val source = localSources[next.mediaId] ?: return@launch
+                        if (path != source.uri && path != LocalMedia.uriOf(next.mediaId)) return@launch
+                        val index = playlist.indexOfFirst { it === next }
+                        if (index < 0) return@launch
+                        localCurrentMediaItemIndex = index
+                        gaplessNext = null
+                        cachedPosition = 0L
+                        cachedDuration = source.durationMs
+                        _playbackFidelity.value = player.fidelity(source)
+                        notifyListeners { onMediaItemTransition(next, PlayerConstants.MEDIA_ITEM_TRANSITION_REASON_AUTO) }
+                        triggerPrecachingInternal()
+                    }
+                }
+
                 override fun finished(player: MpvPlayer) {
                     Logger.d(TAG, "End of stream reached")
                     coroutineScope.launch {
@@ -1656,6 +1722,7 @@ class MpvPlayerAdapter(
                             Logger.d(TAG, "Ignoring finished() during crossfade (old player ended)")
                             return@launch
                         }
+                        if (gaplessNext != null) return@launch
                         transitionToState(InternalState.ENDED)
                         handleTrackEndInternal()
                     }
@@ -1678,7 +1745,14 @@ class MpvPlayerAdapter(
                             return@launch
                         }
                         val currentVideoId = playlist.getOrNull(localCurrentMediaItemIndex)?.mediaId
-                        if (currentVideoId != null) {
+                        if (currentVideoId != null && LocalMedia.isLocal(currentVideoId) && player.retryWithSharedOutput()) {
+                            gaplessJob?.cancel()
+                            gaplessNext = null
+                            player.loadFile(requireNotNull(LocalMedia.uriOf(currentVideoId)), startPaused = !internalPlayWhenReady)
+                            triggerPrecachingInternal()
+                            return@launch
+                        }
+                        if (currentVideoId != null && !LocalMedia.isLocal(currentVideoId)) {
                             // Reset retry count for new track
                             if (retryVideoId != currentVideoId) {
                                 retryVideoId = currentVideoId
@@ -1912,6 +1986,7 @@ class MpvPlayerAdapter(
         val shouldCrossfade =
             crossfadeEnabled &&
                 !crossfadeSuppressed &&
+                !localCrossfadeBlocked() &&
                 // Repeat One loops this track through the branch below instead of fading into the next.
                 internalRepeatMode != PlayerConstants.REPEAT_MODE_ONE &&
                 hasNextMediaItem() &&
@@ -2773,6 +2848,7 @@ class MpvPlayerAdapter(
         positionUpdateJob =
             coroutineScope.launch {
                 while (isActive && currentPlayer != null) {
+                    currentPlayer?.let { _playbackFidelity.value = it.fidelity(localSources[currentMediaItem?.mediaId]) }
                     try {
                         if (internalState == InternalState.PLAYING ||
                             internalState == InternalState.READY ||
@@ -2803,6 +2879,7 @@ class MpvPlayerAdapter(
                             // crossfade during queue restore.
                             if (crossfadeEnabled &&
                                 !crossfadeSuppressed &&
+                                !localCrossfadeBlocked() &&
                                 internalRepeatMode != PlayerConstants.REPEAT_MODE_ONE &&
                                 !isCrossfading &&
                                 internalPlayWhenReady &&
@@ -2858,6 +2935,7 @@ class MpvPlayerAdapter(
      * Trigger precaching
      */
     private fun triggerPrecachingInternal() {
+        syncLocalGapless()
         if (!precacheEnabled || playlist.isEmpty()) return
 
         cancelPrecaching()
@@ -2895,6 +2973,7 @@ class MpvPlayerAdapter(
                         if (!isActive) break
 
                         val mediaItem = playlist.getOrNull(idx) ?: continue
+                        if (LocalMedia.isLocal(mediaItem.mediaId) || bypassActive) continue
 
                         // Network extraction on IO, mpv native calls on the service thread
                         val source = withContext(Dispatchers.IO) { extractPlayableUrl(mediaItem) }
@@ -2927,6 +3006,26 @@ class MpvPlayerAdapter(
                     }
                 }
             }
+    }
+
+    /** One native playlist, one audio output for adjacent lossless album tracks. */
+    private fun syncLocalGapless() {
+        gaplessJob?.cancel()
+        gaplessJob = coroutineScope.launch {
+            val player = currentPlayer ?: return@launch
+            val current = currentMediaItem ?: return@launch
+            val next = if (hasNextMediaItem()) playlist.getOrNull(getNextMediaItemIndex()) else null
+            val source = localSources[current.mediaId]
+            val nextSource = next?.takeIf { LocalMedia.isLocal(it.mediaId) }?.let { localMusicRepository.getTrack(it.mediaId) }
+            if (player !== currentPlayer || currentMediaItem !== current) return@launch
+            if (nextSource != null) localSources = localSources + (nextSource.id to nextSource)
+            val successor = next?.takeIf { internalRepeatMode != PlayerConstants.REPEAT_MODE_ONE && source.isGaplessSuccessor(nextSource) }
+            if (gaplessNext === successor) return@launch
+            gaplessNext = successor
+            val compatible = source?.sampleRate != null && source.bitDepth != null &&
+                source.sampleRate == nextSource?.sampleRate && source.bitDepth == nextSource?.bitDepth
+            if (!player.queueGaplessFile(successor?.let { LocalMedia.uriOf(it.mediaId) }, compatibleFormat = compatible)) gaplessNext = null
+        }
     }
 
     private fun cancelPrecaching() {

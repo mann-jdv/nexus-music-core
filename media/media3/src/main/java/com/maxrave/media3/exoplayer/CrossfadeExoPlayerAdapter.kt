@@ -1,6 +1,9 @@
 package com.maxrave.media3.exoplayer
 
 import android.annotation.SuppressLint
+import com.maxrave.common.LocalMedia
+import androidx.media3.exoplayer.audio.LosslessAudioSink
+import androidx.media3.exoplayer.analytics.AnalyticsListener
 import android.content.Context
 import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
@@ -20,6 +23,9 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.audio.SilenceSkippingAudioProcessor
+import com.maxrave.domain.data.player.PlaybackFidelity
+import com.maxrave.domain.data.player.isGaplessSuccessor
+import com.maxrave.domain.data.entities.LocalTrackEntity
 import com.maxrave.domain.data.player.AudioEffects
 import com.maxrave.domain.data.player.AudioOutput
 import com.maxrave.domain.data.player.GenericCastState
@@ -49,6 +55,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.isActive
@@ -90,6 +97,7 @@ internal class CrossfadeExoPlayerAdapter(
     private val mediaSourceFactory: MergingMediaSourceFactory,
     private val audioAttributes: AudioAttributes,
     private val streamRepository: StreamRepository,
+    private val localMusicRepository: com.maxrave.domain.repository.LocalMusicRepository,
 ) : MediaPlayerInterface {
     // ========== Internal State Enum (same as GstreamerPlayerAdapter) ==========
 
@@ -105,9 +113,47 @@ internal class CrossfadeExoPlayerAdapter(
 
     private fun InternalState.isInReadyState(): Boolean = this == InternalState.READY || this == InternalState.PLAYING || this == InternalState.PAUSED
 
+    @Volatile private var bitPerfectEnabled = true
+    private var localSources: Map<String, LocalTrackEntity> = emptyMap()
+    private val _playbackFidelity = MutableStateFlow(PlaybackFidelity())
+    override val playbackFidelity: StateFlow<PlaybackFidelity> = _playbackFidelity
+    private val losslessMixer = LosslessMixer(context, audioAttributes)
+    private var gaplessNext: GenericMediaItem? = null
+    private var gaplessJob: Job? = null
+    private val bypassActive: Boolean get() = bitPerfectEnabled && _playbackFidelity.value.source?.lossless == true && !isCastActive
+    private fun localCrossfadeBlocked(): Boolean {
+        val current = localSources[currentMediaItem?.mediaId]
+        val next = localSources[playlist.getOrNull(getNextMediaItemIndex())?.mediaId]
+        return current.isGaplessSuccessor(next) || (bitPerfectEnabled && (current?.lossless == true || next?.lossless == true))
+    }
+
     // ========== Crossfade Settings (loaded from DataStore) ==========
 
+    /** Volume normalisation runs as a LoudnessEnhancer in the handler; mirrored here only for the badge. */
+    @Volatile private var normalizeVolumeOn = false
+
     init {
+        coroutineScope.launch {
+            dataStoreManager.normalizeVolume.collect {
+                normalizeVolumeOn = it == DataStoreManager.TRUE
+                updateProcessingStatus()
+            }
+        }
+        coroutineScope.launch {
+            localMusicRepository.tracks.collect { localSources = it.associateBy { track -> track.id } }
+        }
+        coroutineScope.launch {
+            dataStoreManager.bitPerfectLossless.collect { enabled ->
+                if (bitPerfectEnabled != enabled) {
+                    bitPerfectEnabled = enabled
+                    if (_playbackFidelity.value.source?.lossless == true) {
+                        if (isCrossfading) commitIncomingAsCurrentInternal()
+                        clearPrecacheExceptCurrentInternal()
+                        loadAndPlayTrackInternal(localCurrentMediaItemIndex, currentPosition, internalPlayWhenReady)
+                    }
+                }
+            }
+        }
         coroutineScope.launch {
             dataStoreManager.crossfadeEnabled.collect { enabled ->
                 crossfadeEnabled = (enabled == DataStoreManager.TRUE)
@@ -332,7 +378,9 @@ internal class CrossfadeExoPlayerAdapter(
 
     private fun applyPreferredAudioDevice(device: AudioDeviceInfo?) {
         coroutineScope.launch {
+            losslessMixer.clear()
             currentPlayer?.setPreferredAudioDevice(device)
+            if (bypassActive) loadAndPlayTrackInternal(localCurrentMediaItemIndex, currentPosition, internalPlayWhenReady)
             secondaryPlayer?.setPreferredAudioDevice(device)
             precachedPlayers.values.forEach { it.player.setPreferredAudioDevice(device) }
         }
@@ -495,6 +543,10 @@ internal class CrossfadeExoPlayerAdapter(
         if (remotePlayer != null) {
             if (castRemotePlayer === remotePlayer) return
             castRemotePlayer = remotePlayer
+            gaplessJob?.cancel()
+            gaplessNext = null
+            losslessMixer.clear()
+            _playbackFidelity.value = PlaybackFidelity()
             Logger.w(TAG, "Cast session active on ${deviceName ?: "unknown device"} — local playback suspended")
             coroutineScope.launch {
                 // Kill anything that makes local noise or wastes battery while remote.
@@ -564,21 +616,38 @@ internal class CrossfadeExoPlayerAdapter(
      * Audio focus is NOT handled per-player: it is managed once at the adapter level
      * (see the Audio Focus section) so it survives every player swap (#2155).
      */
-    private fun createExoPlayerInstance(): PlayerWithFilter {
+    private fun createExoPlayerInstance(bitPerfect: Boolean = false, sourceBits: Int? = null): PlayerWithFilter {
         val crossfadeFilter = CrossfadeFilterAudioProcessor()
-        val sleepFade = SleepFadeAudioProcessor { internalSleepFadeFactor }
-        val equalizer = EqualizerAudioProcessor { internalEqualizerCurve }
-        val echo = EchoAudioProcessor { internalAudioEffects }
-        val reverb = ConvolutionReverbAudioProcessor { internalAudioEffects }
 
+        lateinit var player: ExoPlayer
         val perPlayerRenderers =
             object : DefaultRenderersFactory(context) {
                 override fun buildAudioSink(
                     context: Context,
                     enableFloatOutput: Boolean,
                     enableAudioTrackPlaybackParams: Boolean,
-                ): AudioSink =
-                    DefaultAudioSink
+                ): AudioSink {
+                    if (bitPerfect) {
+                        return LosslessAudioSink.Builder(context)
+                            .setEnableFloatOutput(true)
+                            .setEnableAudioOutputPlaybackParameters(false)
+                            .build().also { sink ->
+                                sink.setOutputEncodingSelector { format ->
+                                    coroutineScope.launch {
+                                        if (currentPlayer === player && bypassActive) {
+                                            _playbackFidelity.value = _playbackFidelity.value.copy(decodedBitDepth = pcmBitDepth(format.pcmEncoding))
+                                        }
+                                    }
+                                    losslessMixer.selectEncoding(format, sourceBits, outputRouter.preferredDevice)
+                                }
+                                // Ask for the USB bit-perfect mixer before the AudioTrack is built;
+                                // whether it took is read back in onAudioTrackInitialized below.
+                                sink.setOutputFormatListener { config ->
+                                    losslessMixer.configure(config, outputRouter.preferredDevice)
+                                }
+                            }
+                    }
+                    return DefaultAudioSink
                         .Builder(context)
                         .setEnableFloatOutput(enableFloatOutput)
                         .setEnableAudioOutputPlaybackParameters(enableAudioTrackPlaybackParams)
@@ -593,7 +662,13 @@ internal class CrossfadeExoPlayerAdapter(
                                 // crossfade has to be able to sweep them out along with it rather
                                 // than the other way round. The sleep fade stays last, because it
                                 // is the master attenuation and has to survive everything above.
-                                arrayOf(equalizer, echo, reverb, crossfadeFilter, sleepFade),
+                                arrayOf(
+                                    EqualizerAudioProcessor { internalEqualizerCurve },
+                                    EchoAudioProcessor { internalAudioEffects },
+                                    ConvolutionReverbAudioProcessor { internalAudioEffects },
+                                    crossfadeFilter,
+                                    SleepFadeAudioProcessor { internalSleepFadeFactor },
+                                ),
                                 SilenceSkippingAudioProcessor(
                                     2_000_000,
                                     (20_000 / 2_000_000).toFloat(),
@@ -604,9 +679,10 @@ internal class CrossfadeExoPlayerAdapter(
                                 SonicAudioProcessor(),
                             ),
                         ).build()
+                }
             }
 
-        val player =
+        player =
             ExoPlayer
                 .Builder(context)
                 .setAudioAttributes(audioAttributes, false)
@@ -626,6 +702,22 @@ internal class CrossfadeExoPlayerAdapter(
                 .setMediaSourceFactory(mediaSourceFactory)
                 .setRenderersFactory(perPlayerRenderers)
                 .build()
+
+        player.addAnalyticsListener(object : AnalyticsListener {
+            override fun onAudioTrackInitialized(eventTime: AnalyticsListener.EventTime, audioTrackConfig: AudioSink.AudioTrackConfig) {
+                // The AudioTrack's own rate is NOT what reaches the DAC: unless the bit-perfect mixer
+                // holds, the system mixer resamples it. Report the mixer's rate where Android has one.
+                if (player === currentPlayer && _playbackFidelity.value.source != null) {
+                    val status = losslessMixer.status(audioTrackConfig.sampleRate, outputRouter.preferredDevice)
+                    _playbackFidelity.value = _playbackFidelity.value.copy(
+                        outputSampleRate = status.mixerSampleRate,
+                        outputBitDepth = pcmBitDepth(audioTrackConfig.encoding),
+                        bitPerfectOutput = status.bitPerfect && bypassActive,
+                        outputDescription = status.description,
+                    )
+                }
+            }
+        })
 
         // The output the user picked, if any: a player built for the next track, a crossfade or a
         // precache starts where the others are playing rather than back on the system's choice.
@@ -734,6 +826,10 @@ internal class CrossfadeExoPlayerAdapter(
     }
 
     override fun stop() {
+        gaplessJob?.cancel()
+        gaplessNext = null
+        losslessMixer.clear()
+        _playbackFidelity.value = PlaybackFidelity()
         castRemotePlayer?.let { remote ->
             remote.stop()
             return
@@ -1165,6 +1261,10 @@ internal class CrossfadeExoPlayerAdapter(
     }
 
     override fun clearMediaItems() {
+        gaplessJob?.cancel()
+        gaplessNext = null
+        losslessMixer.clear()
+        _playbackFidelity.value = PlaybackFidelity()
         coroutineScope.launch {
             playlist.clear()
             localCurrentMediaItemIndex = -1
@@ -1381,6 +1481,7 @@ internal class CrossfadeExoPlayerAdapter(
                 clearShuffleOrder()
             }
 
+            syncLocalGapless()
             val mediaItemList = getShuffledMediaItemList()
             listeners.forEach { it.onShuffleModeEnabledChanged(value, mediaItemList) }
             notifyTimelineChanged("TIMELINE_CHANGE_REASON_PLAYLIST_CHANGED")
@@ -1393,6 +1494,7 @@ internal class CrossfadeExoPlayerAdapter(
         set(value) {
             if (internalRepeatMode == value) return
             internalRepeatMode = value
+            syncLocalGapless()
             listeners.forEach { it.onRepeatModeChanged(value) }
         }
 
@@ -1408,7 +1510,8 @@ internal class CrossfadeExoPlayerAdapter(
         set(value) {
             internalPlaybackSpeed = value.speed
             internalPlaybackPitch = value.pitch
-            val params = PlaybackParameters(value.speed, value.pitch)
+            updateProcessingStatus()
+            val params = if (bypassActive) PlaybackParameters.DEFAULT else PlaybackParameters(value.speed, value.pitch)
             currentPlayer?.playbackParameters = params
             // Also apply to secondary player during crossfade
             secondaryPlayer?.playbackParameters = params
@@ -1428,6 +1531,7 @@ internal class CrossfadeExoPlayerAdapter(
         set(value) {
             Logger.w(TAG, "Setting volume to $value")
             internalVolume = value.coerceIn(0f, 1f)
+            updateProcessingStatus()
             castRemotePlayer?.volume = internalVolume
             currentPlayer?.volume = internalVolume
             listeners.forEach { it.onVolumeChanged(internalVolume) }
@@ -1451,6 +1555,7 @@ internal class CrossfadeExoPlayerAdapter(
             // would have to be rebuilt as a volume ramp on the receiver. Decided against: the sleep
             // timer simply stops the cast device without fading.
             internalSleepFadeFactor = value.coerceIn(0f, 1f)
+            updateProcessingStatus()
         }
 
     /**
@@ -1470,6 +1575,7 @@ internal class CrossfadeExoPlayerAdapter(
         preampDb: Float,
     ) {
         internalEqualizerCurve = EqualizerCurve(bandsDb, preampDb)
+        updateProcessingStatus()
     }
 
     /**
@@ -1486,13 +1592,15 @@ internal class CrossfadeExoPlayerAdapter(
      */
     override fun setAudioEffects(effects: AudioEffects) {
         internalAudioEffects = effects
+        updateProcessingStatus()
     }
 
     override var skipSilenceEnabled: Boolean
         get() = internalSkipSilence
         set(value) {
             internalSkipSilence = value
-            currentPlayer?.skipSilenceEnabled = value
+            updateProcessingStatus()
+            currentPlayer?.skipSilenceEnabled = value && !bypassActive
             // Also apply to secondary player during crossfade
             secondaryPlayer?.skipSilenceEnabled = value
         }
@@ -1510,6 +1618,8 @@ internal class CrossfadeExoPlayerAdapter(
     // ========== Release Resources ==========
 
     override fun release() {
+        gaplessJob?.cancel()
+        losslessMixer.clear()
         // Cancel all ongoing jobs
         currentLoadJob?.cancel()
         precacheJob?.cancel()
@@ -1603,6 +1713,7 @@ internal class CrossfadeExoPlayerAdapter(
             }
 
             InternalState.ENDED -> {
+                losslessMixer.clear()
                 listeners.forEach { it.onPlaybackStateChanged(PlayerConstants.STATE_ENDED) }
                 listeners.forEach { it.onIsPlayingChanged(false) }
             }
@@ -1620,6 +1731,44 @@ internal class CrossfadeExoPlayerAdapter(
                     )
                 }
             }
+        }
+    }
+
+    private fun effectivePlaybackParameters() =
+        if (bypassActive) PlaybackParameters.DEFAULT else PlaybackParameters(internalPlaybackSpeed, internalPlaybackPitch)
+
+    /**
+     * Whether the app is changing the samples right now. With bypass on, only what bypass cannot
+     * remove counts (a crossfade already under way, in-app volume below 100%, the sleep fade). With
+     * bypass off, each effect counts only while it actually does something: a flat EQ is identity.
+     */
+    private fun updateProcessingStatus() {
+        val dsp = !internalEqualizerCurve.isFlat || internalAudioEffects != AudioEffects.NONE ||
+            internalPlaybackSpeed != 1f || internalPlaybackPitch != 1f || internalSkipSilence || normalizeVolumeOn
+        val processed = isCrossfading || (currentPlayer?.volume ?: internalVolume) != 1f || internalSleepFadeFactor != 1f ||
+            (!bypassActive && dsp)
+        _playbackFidelity.value = _playbackFidelity.value.copy(processing = processed)
+    }
+
+    /** Keep one successor in the SAME ExoPlayer timeline, so its AudioTrack is not torn down. */
+    private fun syncLocalGapless() {
+        gaplessJob?.cancel()
+        gaplessJob = coroutineScope.launch {
+            if (isCastActive) return@launch
+            val player = currentPlayer ?: return@launch
+            val current = currentMediaItem ?: return@launch
+            val next = if (hasNextMediaItem()) playlist.getOrNull(getNextMediaItemIndex()) else null
+            val source = localSources[current.mediaId]
+            val nextSource = next?.takeIf { LocalMedia.isLocal(it.mediaId) }?.let { localMusicRepository.getTrack(it.mediaId) }
+            if (player !== currentPlayer || currentMediaItem !== current) return@launch
+            if (nextSource != null) localSources = localSources + (nextSource.id to nextSource)
+            val successor = next?.takeIf { internalRepeatMode != PlayerConstants.REPEAT_MODE_ONE && source.isGaplessSuccessor(nextSource) && source?.bitDepth == nextSource?.bitDepth }
+            if (gaplessNext === successor) return@launch
+            if (player.currentMediaItemIndex + 1 < player.mediaItemCount) {
+                player.removeMediaItems(player.currentMediaItemIndex + 1, player.mediaItemCount)
+            }
+            gaplessNext = successor
+            successor?.let { player.addMediaItem(it.toMedia3MediaItem()) }
         }
     }
 
@@ -1657,6 +1806,13 @@ internal class CrossfadeExoPlayerAdapter(
         currentLoadJob =
             coroutineScope.launch {
                 try {
+                    val local = if (LocalMedia.isLocal(videoId)) localMusicRepository.getTrack(videoId) else null
+                    if (local != null) localSources = localSources + (videoId to local)
+                    gaplessJob?.cancel()
+                    gaplessNext = null
+                    losslessMixer.clear()
+                    _playbackFidelity.value = PlaybackFidelity(source = local, bypassRequested = bitPerfectEnabled && local?.lossless == true)
+                    updateProcessingStatus()
                     transitionToState(InternalState.PREPARING)
 
                     // Notify media item transition
@@ -1688,7 +1844,7 @@ internal class CrossfadeExoPlayerAdapter(
                         playerFilter = cachedPlayerEntry.filter
                     } else {
                         Logger.d(TAG, "Creating new player for $videoId")
-                        val pwf = createExoPlayerInstance()
+                        val pwf = createExoPlayerInstance(bypassActive, local?.bitDepth)
                         player = pwf.player
                         playerFilter = pwf.filter
                         player.setMediaItem(mediaItem.toMedia3MediaItem())
@@ -1740,8 +1896,8 @@ internal class CrossfadeExoPlayerAdapter(
 
                     // Apply settings
                     player.volume = internalVolume
-                    player.playbackParameters = PlaybackParameters(internalPlaybackSpeed, internalPlaybackPitch)
-                    player.skipSilenceEnabled = internalSkipSilence
+                    player.playbackParameters = effectivePlaybackParameters()
+                    player.skipSilenceEnabled = internalSkipSilence && !bypassActive
 
                     // Seek if needed
                     if (startPositionMs > 0) {
@@ -1799,6 +1955,21 @@ internal class CrossfadeExoPlayerAdapter(
 
         val listener =
             object : Player.Listener {
+                override fun onMediaItemTransition(item: androidx.media3.common.MediaItem?, reason: Int) {
+                    if (player !== currentPlayer || reason != Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) return
+                    val next = gaplessNext?.takeIf { it.mediaId == item?.mediaId } ?: return
+                    val index = playlist.indexOfFirst { it === next }
+                    if (index < 0) return
+                    localCurrentMediaItemIndex = index
+                    gaplessNext = null
+                    cachedPosition = 0L
+                    cachedDuration = player.duration.coerceAtLeast(0L)
+                    _playbackFidelity.value = _playbackFidelity.value.copy(source = localSources[next.mediaId])
+                    listeners.forEach { it.onMediaItemTransition(next, PlayerConstants.MEDIA_ITEM_TRANSITION_REASON_AUTO) }
+                    forwardingPlayer.notifyMediaItemChanged()
+                    triggerPrecachingInternal()
+                }
+
                 override fun onPlaybackStateChanged(playbackState: Int) {
                     when (playbackState) {
                         Player.STATE_ENDED -> {
@@ -2068,8 +2239,8 @@ internal class CrossfadeExoPlayerAdapter(
         // outgoing one carried any tempo/pitch match). Restore normal playback on A+1.
         currentPlayerFilter?.enabled = false
         currentPlayer?.volume = internalVolume
-        currentPlayer?.playbackParameters = PlaybackParameters(internalPlaybackSpeed, internalPlaybackPitch)
-        currentPlayer?.skipSilenceEnabled = internalSkipSilence
+        currentPlayer?.playbackParameters = effectivePlaybackParameters()
+        currentPlayer?.skipSilenceEnabled = internalSkipSilence && !bypassActive
 
         setCrossfading(false)
         crossfadeFromIndex = -1
@@ -2147,6 +2318,7 @@ internal class CrossfadeExoPlayerAdapter(
         val shouldCrossfade =
             crossfadeEnabled &&
                 !crossfadeSuppressed &&
+                !localCrossfadeBlocked() &&
                 // Repeat One loops this track through the branch below instead of fading into the next.
                 internalRepeatMode != PlayerConstants.REPEAT_MODE_ONE &&
                 hasNextMediaItem() &&
@@ -2275,11 +2447,12 @@ internal class CrossfadeExoPlayerAdapter(
                 // Incoming player plays at natural speed/pitch — only the outgoing
                 // player is adjusted to match the incoming track during crossfade.
                 nextPlayer.playbackParameters =
-                    PlaybackParameters(internalPlaybackSpeed, internalPlaybackPitch)
+                    effectivePlaybackParameters()
 
                 // Update now playing IMMEDIATELY (store from-index for cancel scenarios)
                 crossfadeFromIndex = localCurrentMediaItemIndex
                 localCurrentMediaItemIndex = nextIndex
+                _playbackFidelity.value = PlaybackFidelity(source = localSources[playlist.getOrNull(nextIndex)?.mediaId], processing = true)
                 unpinCurrent()
 
                 // Notify our custom listeners IMMEDIATELY (UI updates to new track)
@@ -2499,7 +2672,7 @@ internal class CrossfadeExoPlayerAdapter(
                     secondaryPlayerFilter?.enabled = false
                     // Restore outgoing player's speed/pitch to natural
                     currentPlayer?.playbackParameters =
-                        PlaybackParameters(internalPlaybackSpeed, internalPlaybackPitch)
+                        effectivePlaybackParameters()
                     // Cleanup player
                     nextPlayer.release()
                     secondaryPlayer = null
@@ -2974,8 +3147,8 @@ internal class CrossfadeExoPlayerAdapter(
 
         // Ensure correct volume and playback parameters
         currentPlayer?.volume = internalVolume
-        currentPlayer?.playbackParameters = PlaybackParameters(internalPlaybackSpeed, internalPlaybackPitch)
-        currentPlayer?.skipSilenceEnabled = internalSkipSilence
+        currentPlayer?.playbackParameters = effectivePlaybackParameters()
+        currentPlayer?.skipSilenceEnabled = internalSkipSilence && !bypassActive
 
         // Reset state
         setCrossfading(false)
@@ -3006,6 +3179,7 @@ internal class CrossfadeExoPlayerAdapter(
         positionUpdateJob =
             coroutineScope.launch {
                 while (isActive && currentPlayer != null) {
+                    updateProcessingStatus()
                     try {
                         currentPlayer?.let { player ->
                             if (internalState == InternalState.PLAYING ||
@@ -3028,6 +3202,7 @@ internal class CrossfadeExoPlayerAdapter(
                                 // eat into the audible crossfade window.
                                 if (crossfadeEnabled &&
                                     !crossfadeSuppressed &&
+                                    !localCrossfadeBlocked() &&
                                     internalRepeatMode != PlayerConstants.REPEAT_MODE_ONE &&
                                     !isCrossfading &&
                                     player.isPlaying &&
@@ -3090,6 +3265,7 @@ internal class CrossfadeExoPlayerAdapter(
      * and calls prepare(), which triggers URL resolution and buffering via MediaSourceFactory.
      */
     private fun triggerPrecachingInternal() {
+        syncLocalGapless()
         if (!precacheEnabled || playlist.isEmpty() || isCastActive) return
 
         cancelPrecaching()
@@ -3127,6 +3303,7 @@ internal class CrossfadeExoPlayerAdapter(
                         if (!isActive) break
 
                         val mediaItem = playlist.getOrNull(idx) ?: continue
+                        if (LocalMedia.isLocal(mediaItem.mediaId) || bypassActive) continue
 
                         try {
                             val pwf = createExoPlayerInstance()
@@ -3174,7 +3351,7 @@ internal class CrossfadeExoPlayerAdapter(
     // ========== Internal: Notifications ==========
 
     private fun notifyEqualizerIntent(shouldOpen: Boolean) {
-        listeners.forEach { it.shouldOpenOrCloseEqualizerIntent(shouldOpen) }
+        listeners.forEach { it.shouldOpenOrCloseEqualizerIntent(shouldOpen && !bypassActive) }
     }
 
     // ========== Internal: Shuffle Management ==========

@@ -82,6 +82,10 @@ interface DataStoreManager {
 
     suspend fun setLoggedIn(logged: Boolean)
 
+    val bitPerfectLossless: Flow<Boolean>
+
+    suspend fun setBitPerfectLossless(enabled: Boolean)
+
     val normalizeVolume: Flow<String>
 
     suspend fun setNormalizeVolume(normalize: Boolean)

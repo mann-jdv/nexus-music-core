@@ -422,6 +422,12 @@ internal class MediaServiceHandlerImpl(
                 .distinctUntilChanged()
                 .collect { effects -> player.setAudioEffects(effects) }
         }
+        coroutineScope.launch {
+            player.playbackFidelity.map { it.bypassRequested }.distinctUntilChanged().collect { bypass ->
+                if (bypass) sendCloseEqualizerIntent()
+                mayBeNormalizeVolume()
+            }
+        }
         normalizeVolume =
             runBlocking { dataStoreManager.normalizeVolume.first() == TRUE }
         _nowPlaying.value = player.currentMediaItem
@@ -912,6 +918,7 @@ internal class MediaServiceHandlerImpl(
     }
 
     private fun sendOpenEqualizerIntent() {
+        if (player.playbackFidelity.value.bypassRequested) return
         // No local audio session to expose to an equalizer while casting (or before one exists).
         if (_castState.value.isRemote || player.audioSessionId == PlayerConstants.AUDIO_SESSION_ID_UNSET) return
         context.sendBroadcast(
@@ -2404,12 +2411,14 @@ internal class MediaServiceHandlerImpl(
         runBlocking {
             normalizeVolume = dataStoreManager.normalizeVolume.first() == TRUE
         }
-        if (!normalizeVolume) {
+        if (!normalizeVolume || player.playbackFidelity.value.bypassRequested) {
             loudnessEnhancer?.enabled = false
             loudnessEnhancer?.release()
             loudnessEnhancer = null
+            secondLoudnessEnhancer?.release()
+            secondLoudnessEnhancer = null
             volumeNormalizationJob?.cancel()
-            player.volume = 1f
+            if (!player.playbackFidelity.value.bypassRequested) player.volume = 1f
             return
         }
 
@@ -2459,7 +2468,7 @@ internal class MediaServiceHandlerImpl(
                                 Logger.d(TAG, "Loudness: ${format.loudnessDb} db, $loudnessMb")
                                 try {
                                     loudnessEnhancer?.setTargetGain(0f.toMb() - loudnessMb)
-                                    loudnessEnhancer?.enabled = true
+                                    loudnessEnhancer?.enabled = !player.playbackFidelity.value.bypassRequested
                                     Logger.w(
                                         TAG,
                                         "mayBeNormalizeVolume: ${loudnessEnhancer?.targetGain}",
@@ -2470,7 +2479,7 @@ internal class MediaServiceHandlerImpl(
                                 }
                                 try {
                                     secondLoudnessEnhancer?.setTargetGain(0f.toMb() - loudnessMb)
-                                    secondLoudnessEnhancer?.enabled = true
+                                    secondLoudnessEnhancer?.enabled = !player.playbackFidelity.value.bypassRequested
                                     Logger.w(
                                         TAG,
                                         "mayBeNormalizeVolume: ${secondLoudnessEnhancer?.targetGain}",

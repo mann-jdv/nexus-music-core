@@ -36,6 +36,8 @@ open class MpvPlayerEventAdapter {
     /** `MPV_EVENT_END_FILE` with `MPV_END_FILE_REASON_EOF`. */
     open fun finished(player: MpvPlayer) {}
 
+    open fun fileLoaded(player: MpvPlayer, path: String?) {}
+
     /** `MPV_EVENT_END_FILE` with `MPV_END_FILE_REASON_ERROR`. */
     open fun error(player: MpvPlayer) {}
 
@@ -227,6 +229,7 @@ class MpvPlayer private constructor(
             // play and aborted the whole JVM with
             //   ../src/allocator.c:139: sixel_allocator_malloc: Assertion `allocator' failed.
             // Also covers what VLC's "--quiet" / "--no-video-title-show" did.
+            option("config", "no") // App-owned output policy must not inherit mpv.conf filters/resampling.
             option("terminal", "no")
             // We resolve stream URLs ourselves via StreamRepository, so mpv must never invoke its
             // ytdl_hook Lua script (seen firing as "Running hook: ytdl_hook/on_load"). Leaving it on
@@ -500,7 +503,7 @@ class MpvPlayer private constructor(
                     if (dataPtr == null) {
                         MpvEndFileReason.QUIT
                     } else {
-                        MpvEventEndFile(dataPtr).apply { read() }.reason
+                        MpvEventEndFile(dataPtr).apply { read(); lastPlaybackError = error }.reason
                     }
                 when (reason) {
                     MpvEndFileReason.EOF -> listener?.finished(this)
@@ -510,6 +513,8 @@ class MpvPlayer private constructor(
                     else -> Unit
                 }
             }
+
+            MpvEventId.FILE_LOADED -> listener?.fileLoaded(this, getPropertyString("path"))
 
             MpvEventId.AUDIO_RECONFIG -> {
                 // The audio output was just (re)created, and `ao-volume` only becomes settable once
@@ -716,7 +721,7 @@ class MpvPlayer private constructor(
      */
     private fun applyVolume() =
         synchronized(volumeLock) {
-            val master = masterPercent * sleepPercent / 100.0
+            val master = masterPercent * (if (bitPerfect) 100 else sleepPercent) / 100.0
             if (setPropertyDouble("ao-volume", master, logFailure = false) >= 0) {
                 setPropertyDouble("volume", fadePercent.toDouble())
             } else {
@@ -731,7 +736,8 @@ class MpvPlayer private constructor(
 
     fun setRate(rate: Float) {
         if (isReleased) return
-        setPropertyDouble("speed", rate.toDouble())
+        requestedRate = rate
+        setPropertyDouble("speed", if (bitPerfect) 1.0 else rate.toDouble())
     }
 
     /**
@@ -879,9 +885,86 @@ class MpvPlayer private constructor(
      * sweeps the effects' tails — a reverb that kept ringing at full brightness through a
      * transition would be the one thing in the mix that refuses to fade.
      */
+    @Volatile
+    private var bitPerfect = false
+    @Volatile private var lastPlaybackError = 0
+    private var requestedRate = 1f
+
+    /** Called before loadfile. Preferences remain stored so disabling bypass restores them. */
+    fun setBitPerfect(enabled: Boolean) {
+        bitPerfect = enabled
+        setPropertyString("audio-samplerate", "0")
+        // audio-format stays at the fresh handle's unforced default ("no").
+        setPropertyString("audio-channels", if (enabled) "auto" else "auto-safe")
+        setPropertyString("replaygain", "no")
+        // 'yes' holds the first file's format and can resample subsequent files. 'weak' reopens
+        // only when formats differ, keeping equal-format album transitions truly gapless.
+        setPropertyString("gapless-audio", "weak")
+        setPropertyString("audio-exclusive", if (enabled && System.getProperty("os.name").startsWith("Windows")) "yes" else "no")
+        setPropertyString("audio-pitch-correction", if (enabled) "no" else "yes")
+        setPropertyDouble("speed", if (enabled) 1.0 else requestedRate.toDouble())
+        applyAudioFilters()
+        applyVolume()
+    }
+
+    fun fidelity(source: com.maxrave.domain.data.entities.LocalTrackEntity?): com.maxrave.domain.data.player.PlaybackFidelity {
+        val rate = getPropertyString("audio-out-params/samplerate")?.toIntOrNull()
+        val sampleFormat = getPropertyString("audio-out-params/format").orEmpty()
+        val bits = when {
+            sampleFormat.startsWith("s16") -> 16
+            sampleFormat.startsWith("s32") -> 32
+            sampleFormat.startsWith("float") -> 24
+            sampleFormat.startsWith("double") -> 53
+            else -> null
+        }
+        val filters = getPropertyString("af").orEmpty()
+        val processed = filters.isNotBlank() && filters != "[]" ||
+            getPropertyDouble("speed").let { it.isFinite() && it != 1.0 } ||
+            getPropertyDouble("volume").let { it.isFinite() && it != 100.0 }
+        val driver = currentAudioOutputDriver()
+        // Exclusive mode only stays "yes" while it opened: an AO init failure flips it to shared
+        // in retryWithSharedOutput(). Shared outputs go through the OS mixer, which may resample
+        // after mpv and does not tell us, so they are never called bit-perfect.
+        val exclusive = bitPerfect && driver == "wasapi" && getPropertyString("audio-exclusive") == "yes"
+        val description =
+            when {
+                exclusive -> "WASAPI exclusive"
+                driver == "wasapi" -> "Windows shared mixer (may resample)"
+                driver == "coreaudio" || driver == "avfoundation" -> "macOS Core Audio mixer (may resample)"
+                driver == "pipewire" || driver == "pulse" -> "$driver server (may resample)"
+                driver != null -> driver
+                else -> null
+            }
+        return com.maxrave.domain.data.player.PlaybackFidelity(
+            source = source,
+            bypassRequested = bitPerfect,
+            outputSampleRate = rate,
+            outputBitDepth = bits,
+            processing = processed,
+            bitPerfectOutput = exclusive && !processed && rate != null && rate == source?.sampleRate,
+            outputDescription = description,
+        )
+    }
+
+    /** Retain only the playing entry; native mpv owns the next album transition. */
+    fun queueGaplessFile(url: String?, compatibleFormat: Boolean = true): Boolean {
+        if (isReleased) return false
+        // weak mode can retain a narrower integer format across tracks. Reopen for any
+        // format change so a 24-bit successor never inherits a 16-bit output.
+        setPropertyString("gapless-audio", if (compatibleFormat) "weak" else "no")
+        command("playlist-clear")
+        return url == null || command("loadfile", url, "append")
+    }
+
+    /** One explicit shared-mode fallback when WASAPI cannot open exclusively. */
+    fun retryWithSharedOutput(): Boolean {
+        if (!bitPerfect || lastPlaybackError != -14 || getPropertyString("audio-exclusive") != "yes") return false
+        return setPropertyString("audio-exclusive", "no")
+    }
+
     private fun applyAudioFilters(): Boolean {
         val entries = listOfNotNull(eqEntry) + fxEntries + crossfadeEntries
-        return setPropertyString("af", entries.joinToString(","))
+        return setPropertyString("af", if (bitPerfect) "" else entries.joinToString(","))
     }
 
     /**
