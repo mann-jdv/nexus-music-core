@@ -23,7 +23,11 @@ fun loadAllModules(appIdentity: AppIdentity) {
     loadKoinModules(listenTogetherModule)
     loadMediaService()
     loadLoginSyncModule()
+    loadLocalMusicModule()
 }
+
+/** Binds the platform's LocalMediaScanner (local file playback; nothing on iOS). */
+expect fun loadLocalMusicModule()
 
 expect fun loadMediaService()
 

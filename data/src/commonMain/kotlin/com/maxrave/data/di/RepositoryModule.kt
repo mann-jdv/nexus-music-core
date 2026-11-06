@@ -6,6 +6,18 @@ import com.maxrave.data.io.fileDir
 import com.maxrave.data.repository.AccountRepositoryImpl
 import com.maxrave.data.repository.AlbumRepositoryImpl
 import com.maxrave.data.repository.AnalyticsRepositoryImpl
+import com.maxrave.data.db.MusicDatabase
+import com.maxrave.data.localmusic.LocalMediaScanner
+import com.maxrave.data.repository.LocalMusicRepositoryImpl
+import com.maxrave.domain.repository.LocalMusicRepository
+import com.maxrave.domain.usecase.localmusic.AddLocalFolderUseCase
+import com.maxrave.domain.usecase.localmusic.GetLocalAlbumsUseCase
+import com.maxrave.domain.usecase.localmusic.GetLocalArtistsUseCase
+import com.maxrave.domain.usecase.localmusic.GetLocalFoldersUseCase
+import com.maxrave.domain.usecase.localmusic.GetLocalTracksUseCase
+import com.maxrave.domain.usecase.localmusic.RemoveLocalFolderUseCase
+import com.maxrave.domain.usecase.localmusic.ScanLocalMusicUseCase
+import com.maxrave.domain.usecase.localmusic.SearchLocalTracksUseCase
 import com.maxrave.data.repository.ArtistRepositoryImpl
 import com.maxrave.data.repository.AutoEqRepositoryImpl
 import com.maxrave.data.lyrics.LyricsRomanizerRepositoryImpl
@@ -117,6 +129,19 @@ val repositoryModule =
         single<StreamRepository>(createdAtStart = true) {
             StreamRepositoryImpl(get(), get())
         }
+
+        // Local file playback. The scanner is bound per platform in loadLocalMusicModule().
+        single<LocalMusicRepository> {
+            LocalMusicRepositoryImpl(get<MusicDatabase>().getLocalMusicDao(), get<LocalMediaScanner>())
+        }
+        factory { AddLocalFolderUseCase(get()) }
+        factory { RemoveLocalFolderUseCase(get()) }
+        factory { ScanLocalMusicUseCase(get()) }
+        factory { GetLocalFoldersUseCase(get()) }
+        factory { GetLocalTracksUseCase(get()) }
+        factory { GetLocalAlbumsUseCase(get()) }
+        factory { GetLocalArtistsUseCase(get()) }
+        factory { SearchLocalTracksUseCase(get()) }
 
         single<AnalyticsRepository>(createdAtStart = true) {
             AnalyticsRepositoryImpl(get())

@@ -692,6 +692,8 @@ enum class LibraryChipType {
     FAVORITE_PLAYLIST,
     DOWNLOADED_PLAYLIST,
     FAVORITE_PODCAST,
+    // Nexus Music: files the user owns, scanned from folders they picked.
+    LOCAL_MUSIC,
     ;
 
     fun toStringValue(): String =
@@ -705,6 +707,7 @@ enum class LibraryChipType {
             FAVORITE_PODCAST -> "favorite_podcast"
             CHART -> "chart"
             WRAPPED -> "wrapped"
+            LOCAL_MUSIC -> "local_music"
         }
 
     companion object {
@@ -719,6 +722,7 @@ enum class LibraryChipType {
                 "favorite_podcast" -> FAVORITE_PODCAST
                 "chart" -> CHART
                 "wrapped" -> WRAPPED
+                "local_music" -> LOCAL_MUSIC
                 else -> null
             }
     }

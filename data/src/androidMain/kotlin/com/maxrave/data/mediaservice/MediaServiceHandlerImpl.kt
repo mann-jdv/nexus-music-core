@@ -19,6 +19,7 @@ import com.maxrave.common.Config.VIDEO_CLICK
 import com.maxrave.common.DESC
 import com.maxrave.common.LOCAL_PLAYLIST_ID
 import com.maxrave.common.LOCAL_PLAYLIST_ID_SAVED_QUEUE
+import com.maxrave.common.LocalMedia
 import com.maxrave.common.MERGING_DATA_TYPE
 import com.maxrave.common.SPONSOR_BLOCK_MIN_SEGMENT_SECONDS
 import com.maxrave.common.SPONSOR_BLOCK_SKIP_MARGIN_MS
@@ -741,10 +742,10 @@ internal class MediaServiceHandlerImpl(
                             }
                         }
                     }
-                if (dataStoreManager.sponsorBlockEnabled.first() == TRUE) {
+                if (!LocalMedia.isLocal(videoId) && dataStoreManager.sponsorBlockEnabled.first() == TRUE) {
                     getSkipSegments(videoId)
                 }
-                if (dataStoreManager.sendBackToGoogle.first() == TRUE) {
+                if (!LocalMedia.isLocal(videoId) && dataStoreManager.sendBackToGoogle.first() == TRUE) {
                     getFormat(videoId)
                 }
             }
@@ -1667,6 +1668,8 @@ internal class MediaServiceHandlerImpl(
             val lastTrack =
                 queueData.value.data.listTracks
                     .lastOrNull() ?: return
+            // A local file has no YouTube radio to extend into; the queue simply ends.
+            if (LocalMedia.isLocal(lastTrack.videoId)) return
             _queueData.update {
                 it.copy(
                     queueState = QueueData.StateSource.STATE_INITIALIZED,
@@ -1688,6 +1691,8 @@ internal class MediaServiceHandlerImpl(
     }
 
     override fun getRelated(videoId: String) {
+        // Local files have no related tracks to fetch, and asking would be a network call.
+        if (LocalMedia.isLocal(videoId)) return
         if (queueData.value.queueState == QueueData.StateSource.STATE_INITIALIZING) return
         coroutineScope.launch {
             songRepository.getRelatedData(videoId).collect { response ->

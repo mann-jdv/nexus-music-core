@@ -144,6 +144,8 @@ kotlin {
                 implementation(libs.jna.platform)
                 // Login sync: the Desktop receives sign-ins from the phone
                 implementation(projects.loginSync)
+                // Local file playback: tags + audio header for the Desktop scanner
+                implementation(libs.jaudiotagger)
             }
         }
     }

@@ -1,5 +1,6 @@
 package com.maxrave.domain.extension
 
+import com.maxrave.common.LocalMedia
 import com.maxrave.common.MERGING_DATA_TYPE
 import com.maxrave.domain.data.entities.SongEntity
 import com.maxrave.domain.data.model.browse.album.Track
@@ -68,7 +69,36 @@ fun GenericMediaItem.toSongEntity(): SongEntity =
         downloadState = 0,
     )
 
+/**
+ * A file the user owns: the URI rides in the id ([LocalMedia]), so the item can be rebuilt from a
+ * bare song row or queue entry. Always audio, never cached under a key, no YouTube thumbnail
+ * fallback (that would be a network request for a picture that cannot exist).
+ */
+private fun localGenericMediaItem(
+    videoId: String,
+    title: String,
+    artist: String?,
+    album: String?,
+    artwork: String?,
+): GenericMediaItem =
+    GenericMediaItem(
+        mediaId = videoId,
+        uri = LocalMedia.uriOf(videoId),
+        metadata =
+            GenericMediaMetadata(
+                title = title,
+                artist = artist,
+                albumTitle = album,
+                artworkUri = artwork,
+                description = MERGING_DATA_TYPE.SONG,
+            ),
+        customCacheKey = null,
+    )
+
 fun SongEntity.toGenericMediaItem(): GenericMediaItem {
+    if (LocalMedia.isLocal(videoId)) {
+        return localGenericMediaItem(videoId, title, artistName?.connectArtists(), albumName, thumbnails)
+    }
     val isSong = (this.thumbnails?.contains("w544") == true && this.thumbnails.contains("h544"))
     return GenericMediaItem(
         mediaId = this.videoId,
@@ -86,6 +116,15 @@ fun SongEntity.toGenericMediaItem(): GenericMediaItem {
 }
 
 fun Track.toGenericMediaItem(): GenericMediaItem {
+    if (LocalMedia.isLocal(videoId)) {
+        return localGenericMediaItem(
+            videoId,
+            title,
+            artists.toListName().connectArtists(),
+            album?.name,
+            thumbnails?.lastOrNull()?.url,
+        )
+    }
     var thumbUrl =
         this.thumbnails?.last()?.url
             ?: "http://i.ytimg.com/vi/${this.videoId}/maxresdefault.jpg"

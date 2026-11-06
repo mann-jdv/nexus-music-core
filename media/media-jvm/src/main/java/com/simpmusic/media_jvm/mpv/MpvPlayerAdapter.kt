@@ -1,5 +1,6 @@
 package com.simpmusic.media_jvm.mpv
 
+import com.maxrave.common.LocalMedia
 import com.maxrave.common.MERGING_DATA_TYPE
 import com.maxrave.domain.data.player.AppOnScreen
 import com.maxrave.domain.data.player.AudioEffects
@@ -2421,7 +2422,8 @@ class MpvPlayerAdapter(
     )
 
     private suspend fun loadAudioMetaIfNeeded(videoId: String) {
-        if (videoId.isBlank() || audioMetaCache.containsKey(videoId)) return
+        // Local files carry no YouTube format row, so there is nothing to look up.
+        if (videoId.isBlank() || LocalMedia.isLocal(videoId) || audioMetaCache.containsKey(videoId)) return
         try {
             val format = streamRepository.getNewFormat(videoId).firstOrNull()
             if (format == null) {
@@ -3136,6 +3138,16 @@ class MpvPlayerAdapter(
      */
     private suspend fun extractPlayableUrl(mediaItem: GenericMediaItem): PlayableSource? {
         Logger.w(TAG, "Extracting playable URL for ${mediaItem.mediaId}")
+        // A file the user owns (Nexus Music local playback): the path rides in the id. One plain
+        // audio source — no format lookup, no 403 probe, no edl:// merge, nothing on the network.
+        if (LocalMedia.isLocal(mediaItem.mediaId)) {
+            val path = LocalMedia.uriOf(mediaItem.mediaId) ?: return null
+            if (!File(path).isFile) {
+                Logger.w(TAG, "Local file is gone: $path")
+                return null
+            }
+            return PlayableSource(isVideo = false, url = path)
+        }
         val shouldFindVideo =
             mediaItem.isVideo() &&
                 dataStoreManager.watchVideoInsteadOfPlayingAudio.first() == DataStoreManager.TRUE

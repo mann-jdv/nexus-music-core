@@ -16,7 +16,9 @@ import com.maxrave.domain.data.entities.AutoEqIndexMetaEntity
 import com.maxrave.domain.data.entities.EpisodeEntity
 import com.maxrave.domain.data.entities.FollowedArtistSingleAndAlbum
 import com.maxrave.domain.data.entities.GoogleAccountEntity
+import com.maxrave.domain.data.entities.LocalFolderEntity
 import com.maxrave.domain.data.entities.LocalPlaylistEntity
+import com.maxrave.domain.data.entities.LocalTrackEntity
 import com.maxrave.domain.data.entities.LyricsEntity
 import com.maxrave.domain.data.entities.NewFormatEntity
 import com.maxrave.domain.data.entities.NotificationEntity
@@ -41,9 +43,10 @@ import com.maxrave.domain.data.entities.analytics.PlaybackEventEntity
         NotificationEntity::class, TranslatedLyricsEntity::class, PodcastsEntity::class, EpisodeEntity::class,
         YourYouTubePlaylistList::class, PlaybackEventEntity::class, EventArtistEntity::class,
         AutoEqEntryEntity::class, AutoEqIndexMetaEntity::class, AutoEqCurveEntity::class,
-        ArtistMotionEntity::class
+        ArtistMotionEntity::class,
+        LocalFolderEntity::class, LocalTrackEntity::class,
     ],
-    version = 27,
+    version = 28,
     exportSchema = true,
     autoMigrations = [
         AutoMigration(from = 2, to = 3), AutoMigration(
@@ -98,11 +101,18 @@ import com.maxrave.domain.data.entities.analytics.PlaybackEventEntity
         AutoMigration(26, 27),
         AutoMigration(25, 27),
         AutoMigration(24, 27),
+        // 28 adds local_folder and local_track (Nexus Music local file playback). Two new tables and
+        // nothing else, so Room generates the migration itself and no existing row is touched.
+        AutoMigration(27, 28),
+        AutoMigration(26, 28),
+        AutoMigration(25, 28),
     ],
 )
 @TypeConverters(Converters::class)
 abstract class MusicDatabase : RoomDatabase() {
     abstract fun getDatabaseDao(): DatabaseDao
+
+    abstract fun getLocalMusicDao(): LocalMusicDao
 
     /**
      * Rewrite the database file so the pages a bulk delete freed go back to the filesystem.

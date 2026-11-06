@@ -12,6 +12,10 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import androidx.media3.extractor.DefaultExtractorsFactory
+import com.maxrave.common.LocalMedia
 import com.maxrave.common.MERGING_DATA_TYPE
 import com.maxrave.domain.data.player.LiveStreamRegistry
 import com.maxrave.domain.manager.DataStoreManager
@@ -44,7 +48,26 @@ internal class MergingMediaSourceFactory(
 
     override fun getSupportedTypes(): IntArray = defaultMediaSourceFactory.supportedTypes
 
+    // A file the user owns (Nexus Music local playback): read straight from its content:// URI,
+    // with every Media3 extractor (WAV, MP3, Ogg/Opus, ADTS too, which the YouTube path leaves out)
+    // and no cache. Built lazily so the YouTube-only player never pays for it.
+    private val localMediaSourceFactory by lazy {
+        ProgressiveMediaSource.Factory(DefaultDataSource.Factory(context), DefaultExtractorsFactory())
+    }
+
     override fun createMediaSource(mediaItem: MediaItem): MediaSource {
+        if (LocalMedia.isLocal(mediaItem.mediaId)) {
+            // The URI rides in the id, so this works for an item rebuilt from a bare queue entry too.
+            val uri = LocalMedia.uriOf(mediaItem.mediaId)
+            Logger.d("Merging Media Source", "${mediaItem.mediaId} is a local file; bypassing the stream resolver")
+            return localMediaSourceFactory.createMediaSource(
+                mediaItem
+                    .buildUpon()
+                    .setUri(uri)
+                    .setCustomCacheKey(null)
+                    .build(),
+            )
+        }
         if (LiveStreamRegistry.isLive(mediaItem.mediaId)) {
             // One HLS playlist carrying audio and video together: no merge, and none of the
             // progressive resolver's caching or chunking.
