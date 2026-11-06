@@ -1745,7 +1745,9 @@ internal class CrossfadeExoPlayerAdapter(
     private fun updateProcessingStatus() {
         val dsp = !internalEqualizerCurve.isFlat || internalAudioEffects != AudioEffects.NONE ||
             internalPlaybackSpeed != 1f || internalPlaybackPitch != 1f || internalSkipSilence || normalizeVolumeOn
-        val processed = isCrossfading || (currentPlayer?.volume ?: internalVolume) != 1f || internalSleepFadeFactor != 1f ||
+        // Reads adapter fields only, NEVER the ExoPlayer: setEqualizer/setAudioEffects/sleepFadeFactor
+        // call this from background threads, and ExoPlayer throws off the main thread.
+        val processed = isCrossfading || internalVolume != 1f || internalSleepFadeFactor != 1f ||
             (!bypassActive && dsp)
         _playbackFidelity.value = _playbackFidelity.value.copy(processing = processed)
     }
